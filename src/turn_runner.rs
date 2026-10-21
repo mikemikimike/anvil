@@ -175,6 +175,7 @@ pub(crate) async fn run_prompt_turn(request: PromptTurnRequest<'_>) -> PromptTur
             // should stop and surface it rather than back off and retry.
             LoopOutcome {
                 response: "Error: agent loop panicked. See server logs.".to_string(),
+                final_assistant_response: None,
                 tool_exchanges: Vec::new(),
                 replay_events: Vec::new(),
                 usage: TokenUsage::default(),
@@ -200,6 +201,7 @@ pub(crate) async fn run_prompt_turn(request: PromptTurnRequest<'_>) -> PromptTur
     }
     let LoopOutcome {
         response: response_text,
+        final_assistant_response,
         tool_exchanges,
         replay_events,
         usage: turn_usage,
@@ -224,8 +226,9 @@ pub(crate) async fn run_prompt_turn(request: PromptTurnRequest<'_>) -> PromptTur
         .record_usage(session_id, turn_usage, cost_delta_usd)
         .await
         .unwrap_or(turn_usage);
-    let structured_output_result =
-        structured_output_request.map(|request| validate_response(request, &response_text));
+    let structured_output_result = structured_output_request.map(|request| {
+        validate_response(request, final_assistant_response.as_deref().unwrap_or(""))
+    });
 
     // Build the turn up front so the recap summarizer can read it without
     // cloning the tool exchanges. `agent_response` holds the raw model text for

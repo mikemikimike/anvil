@@ -2192,6 +2192,12 @@ fn run_smoke_case(case: &SmokeCase) {
 
     let prompt = client.request("session/prompt", prompt_params);
     assert_response_ok(case, "session/prompt", &prompt, &client);
+    let streamed = collect_agent_message_text(&mut client);
+    assert!(
+        streamed.contains(r#"{"answer":"Progress before tool use."}"#),
+        "{}: ACP transcript dropped intermediate assistant text: {streamed:?}",
+        case.name
+    );
     assert!(
         !client.exited(),
         "{}: anvil exited after prompt; stderr:\n{}\ntrace:\n{}",
@@ -3172,10 +3178,16 @@ fn handle_provider_connection(
 }
 
 fn tool_call_sse_body() -> String {
-    tool_call_sse_body_for(
-        "call_write",
-        "write_file",
-        r#"{"file_path":"blocked.txt","content":"blocked"}"#,
+    let args = serde_json::to_string(r#"{"file_path":"blocked.txt","content":"blocked"}"#)
+        .expect("encode args");
+    let content = serde_json::to_string(r#"{"answer":"Progress before tool use."}"#)
+        .expect("encode intermediate assistant text");
+    format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{content},\"tool_calls\":[{{\"index\":0,\"id\":\"call_write\",\"function\":{{\"name\":\"write_file\",\"arguments\":{args}}}}}]}}}}]}}\n\
+         \n\
+         data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":12,\"completion_tokens\":4}}}}\n\
+         \n\
+         data: [DONE]\n\n"
     )
 }
 

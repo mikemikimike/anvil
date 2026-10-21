@@ -547,6 +547,9 @@ pub(crate) struct LoopOutcome {
     /// The assistant's visible text for the turn: model output plus, for the
     /// silent terminations, the appended closing notice.
     pub response: String,
+    /// Final assistant text completion, kept separate from the visible
+    /// transcript so intermediate tool-turn text cannot affect validation.
+    pub final_assistant_response: Option<String>,
     pub tool_exchanges: Vec<ToolExchange>,
     pub replay_events: Vec<TurnReplayEvent>,
     pub usage: TokenUsage,
@@ -572,6 +575,7 @@ impl LoopOutcome {
                 message: message.clone(),
             }),
             response: message,
+            final_assistant_response: None,
             tool_exchanges: Vec::new(),
             replay_events: Vec::new(),
             usage: TokenUsage::default(),
@@ -2053,6 +2057,7 @@ pub(crate) async fn run(
     };
     apply_tool_catalog_restrictions(&mut tools, tool_restrictions);
     let mut full_response = String::new();
+    let mut final_assistant_response = None;
     // Captured per-call so the caller can persist them with the turn (#3409),
     // letting a `session/load` re-feed the LLM the same tool context the
     // model had when it produced `full_response`.
@@ -2582,6 +2587,7 @@ pub(crate) async fn run(
                         }
                     }
                 }
+                final_assistant_response = Some(text.clone());
                 full_response.push_str(&text);
                 if !text.is_empty() && !replay_events.is_empty() {
                     replay_events.push(TurnReplayEvent::AssistantText { text: text.clone() });
@@ -2957,6 +2963,7 @@ pub(crate) async fn run(
     });
     LoopOutcome {
         response: full_response,
+        final_assistant_response,
         tool_exchanges,
         replay_events,
         usage: turn_usage,

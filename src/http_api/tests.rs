@@ -460,7 +460,12 @@ enum MockBehavior {
     Echo,
     HangUntilCancelled,
     WriteFileThenDone,
+    ReadFileWithStructuredIntermediate { final_text: &'static str },
 }
+
+const INTERMEDIATE_STRUCTURED_TEXT: &str = r#"{"report":"intermediate"}"#;
+const SINGLE_TURN_STRUCTURED_TEXT: &str = r#"{"report":"single turn"}"#;
+const INVALID_STRUCTURED_TEXT: &str = "not json";
 
 struct MockBackend {
     behavior: MockBehavior,
@@ -479,10 +484,15 @@ impl LlmBackend for MockBackend {
         match self.behavior {
             MockBehavior::Echo => {
                 let mut on_token = request.on_token;
+                let text = if request.structured_output.is_some() {
+                    SINGLE_TURN_STRUCTURED_TEXT.to_string()
+                } else {
+                    "Hello from mock".to_string()
+                };
                 async move {
-                    on_token("Hello from mock");
+                    on_token(&text);
                     Ok(LlmResponse::Text {
-                        text: "Hello from mock".to_string(),
+                        text,
                         reasoning_content: None,
                         usage: TokenUsage {
                             input_tokens: 3,
@@ -537,6 +547,45 @@ impl LlmBackend for MockBackend {
                     .boxed()
                 }
             }
+            MockBehavior::ReadFileWithStructuredIntermediate { final_text } => {
+                let call_index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call_index == 0 {
+                    let mut on_token = request.on_token;
+                    async move {
+                        on_token(INTERMEDIATE_STRUCTURED_TEXT);
+                        Ok(LlmResponse::ToolCalls {
+                            text: INTERMEDIATE_STRUCTURED_TEXT.to_string(),
+                            reasoning_content: None,
+                            calls: vec![anvil_client::llm_client::ToolCall {
+                                id: "call-read-file".to_string(),
+                                r#type: "function".to_string(),
+                                function: anvil_client::llm_client::FunctionCall {
+                                    name: "read_file".to_string(),
+                                    arguments: serde_json::json!({
+                                        "file_path": "input.txt",
+                                    })
+                                    .to_string(),
+                                },
+                            }],
+                            usage: TokenUsage::default(),
+                            codex_reasoning: None,
+                        })
+                    }
+                    .boxed()
+                } else {
+                    let mut on_token = request.on_token;
+                    async move {
+                        on_token(final_text);
+                        Ok(LlmResponse::Text {
+                            text: final_text.to_string(),
+                            reasoning_content: None,
+                            usage: TokenUsage::default(),
+                            codex_reasoning: None,
+                        })
+                    }
+                    .boxed()
+                }
+            }
         }
     }
 }
@@ -581,6 +630,144 @@ async fn poll_run_until_terminal(addr: SocketAddr, run_id: &str) -> Value {
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+}
+
+fn structured_output_spec() -> Value {
+    serde_json::json!({
+        "schema_name": "ExampleReport",
+        "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "report": {"type": "string"}
+            },
+            "required": ["report"]
+        },
+        "allow_coercion": false
+    })
+}
+
+async fn run_with_structured_output(
+    addr: SocketAddr,
+    session_id: &str,
+    prompt: &str,
+) -> (Value, String) {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{addr}/v1/sessions/{session_id}/runs"))
+        .json(&serde_json::json!({
+            "prompt": prompt,
+            "structured_output": structured_output_spec()
+        }))
+        .send()
+        .await
+        .expect("create structured-output run");
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let created = response.json::<Value>().await.expect("JSON body");
+    let run_id = created["id"].as_str().expect("run id");
+    let run = poll_run_until_terminal(addr, run_id).await;
+    let events = client
+        .get(format!("http://{addr}/v1/runs/{run_id}/events"))
+        .send()
+        .await
+        .expect("events request")
+        .text()
+        .await
+        .expect("events body");
+    (run, events)
+}
+
+#[tokio::test]
+async fn structured_output_uses_final_completion_after_tool_call() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("input.txt"), "tool result").expect("write input file");
+    let cwd = workspace.path().display().to_string();
+    let (addr, _) = start_run_server(MockBehavior::ReadFileWithStructuredIntermediate {
+        final_text: r#"{"report":"final report"}"#,
+    })
+    .await;
+    let session_id = create_test_session(addr, &cwd).await;
+    let (run, events) = run_with_structured_output(addr, &session_id, "inspect input.txt").await;
+    let full_response = format!(
+        "{INTERMEDIATE_STRUCTURED_TEXT}{}",
+        r#"{"report":"final report"}"#
+    );
+
+    assert_eq!(run["status"], "completed", "run: {run}");
+    assert_eq!(run["result_text"], full_response);
+    assert_eq!(run["structured_output"]["status"], "success");
+    assert_eq!(
+        run["structured_output"]["validated_output"],
+        serde_json::json!({"report":"final report"})
+    );
+    assert!(events.contains("intermediate"));
+    assert!(events.contains("final report"));
+    assert!(events.contains("event: tool_call.completed"));
+
+    let (status, session) = get_json(
+        addr,
+        &format!("/v1/sessions/{session_id}?include_history=true"),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(session["history"][0]["agent_response"], full_response);
+    assert_eq!(
+        session["history"][0]["tool_exchanges"][0]["tool_name"],
+        "read_file"
+    );
+    assert!(
+        session["history"][0]["tool_exchanges"][0]["result"]
+            .as_str()
+            .expect("tool result")
+            .contains("tool result")
+    );
+}
+
+#[tokio::test]
+async fn structured_output_rejects_invalid_final_after_valid_intermediate_json() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::write(workspace.path().join("input.txt"), "tool result").expect("write input file");
+    let cwd = workspace.path().display().to_string();
+    let (addr, _) = start_run_server(MockBehavior::ReadFileWithStructuredIntermediate {
+        final_text: INVALID_STRUCTURED_TEXT,
+    })
+    .await;
+    let session_id = create_test_session(addr, &cwd).await;
+    let (run, _) = run_with_structured_output(addr, &session_id, "inspect input.txt").await;
+
+    assert_eq!(run["status"], "completed", "run: {run}");
+    assert_eq!(run["structured_output"]["status"], "validation_error");
+    assert_eq!(
+        run["structured_output"]["invalid_excerpt"],
+        INVALID_STRUCTURED_TEXT
+    );
+    assert!(
+        run["structured_output"]["errors"][0]["message"]
+            .as_str()
+            .expect("validation message")
+            .contains("response is not valid JSON")
+    );
+    assert_eq!(
+        run["result_text"],
+        format!("{INTERMEDIATE_STRUCTURED_TEXT}{INVALID_STRUCTURED_TEXT}")
+    );
+}
+
+#[tokio::test]
+async fn structured_output_still_validates_single_turn_completion() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let cwd = workspace.path().display().to_string();
+    let (addr, _) = start_run_server(MockBehavior::Echo).await;
+    let session_id = create_test_session(addr, &cwd).await;
+    let (run, _) = run_with_structured_output(addr, &session_id, "return a report").await;
+
+    assert_eq!(run["status"], "completed", "run: {run}");
+    assert_eq!(run["result_text"], SINGLE_TURN_STRUCTURED_TEXT);
+    assert_eq!(run["structured_output"]["status"], "success");
+    assert_eq!(
+        run["structured_output"]["validated_output"],
+        serde_json::json!({"report":"single turn"})
+    );
 }
 
 #[tokio::test]
